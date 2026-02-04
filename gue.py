@@ -6,17 +6,18 @@ from datasets import load_dataset, get_dataset_config_names
 import numpy as np
 from sklearn.metrics import accuracy_score, matthews_corrcoef
 from sklearn.manifold import TSNE
-import plotly.express as px
-import plotly.io as pio
+import matplotlib.pyplot as plt
+import seaborn as sns
 import tqdm
 import argparse
 import os
 import json
 
-# Ensure Plotly saves as PNG
-pio.templates.default = "plotly_white"
+# Ensure matplotlib backend is non-interactive for servers
+import matplotlib
+matplotlib.use('Agg') 
 
-# --- 1. Model Definitions (MATCHING TRAINING) ---
+# --- 1. Model Definitions (UNCHANGED) ---
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=2048):
         super().__init__()
@@ -126,66 +127,46 @@ class LinearProbe(nn.Module):
 
 # --- 3. Visualization Function ---
 def create_tsne_plot(embeddings, labels, task_name, output_dir="plots"):
-    """
-    embeddings: (N, D) numpy array
-    labels: (N,) numpy array
-    task_name: string
-    """
     os.makedirs(output_dir, exist_ok=True)
     
-    # 1. Run t-SNE
     print(f"  Computing t-SNE for {len(embeddings)} points...")
     tsne = TSNE(n_components=2, perplexity=30, random_state=42, init='pca', learning_rate='auto')
     projections = tsne.fit_transform(embeddings)
     
-    # 2. Create Plotly Figure
-    # Map numeric labels to text if binary
     label_text = labels.astype(str)
-    if len(set(labels)) == 2:
-        label_map = {'0': 'Negative (0)', '1': 'Positive (1)'}
-        label_text = [label_map.get(l, l) for l in label_text]
-        
-    fig = px.scatter(
+    unique_labels = sorted(list(set(labels)))
+    if len(unique_labels) == 2:
+        mapping = {unique_labels[0]: 'Negative', unique_labels[1]: 'Positive'}
+        hue_labels = [mapping[l] for l in labels]
+    else:
+        hue_labels = labels
+
+    plt.figure(figsize=(10, 8))
+    sns.set_context("talk")
+    sns.set_style("whitegrid")
+    
+    scatter = sns.scatterplot(
         x=projections[:, 0], 
         y=projections[:, 1],
-        color=label_text,
-        title=f"t-SNE Projection: {task_name}",
-        labels={'color': 'Class'},
-        opacity=0.7
+        hue=hue_labels,
+        palette="viridis",
+        s=60,
+        alpha=0.8,
+        edgecolor='w'
     )
     
-    # 3. Style Improvements
-    fig.update_layout(
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        ),
-        xaxis_title="t-SNE Dim 1",
-        yaxis_title="t-SNE Dim 2",
-        template="plotly_white",
-        width=1000,
-        height=800
-    )
-    fig.update_traces(marker=dict(size=6))
+    plt.title(f"t-SNE Projection: {task_name}", fontsize=16)
+    plt.xlabel("t-SNE Dim 1")
+    plt.ylabel("t-SNE Dim 2")
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', title="Class")
+    plt.tight_layout()
     
-    # 4. Save
     filename = os.path.join(output_dir, f"tsne_{task_name}.png")
-    fig.write_image(filename)
-    
-    # Metadata for accessibility/tracking
-    meta = {
-        "caption": f"t-SNE visualization of DNA-JEPA embeddings for {task_name}",
-        "description": "Scatter plot showing the separation of genomic sequence classes in the model's latent space."
-    }
-    with open(filename + ".meta.json", "w") as f:
-        json.dump(meta, f)
-        
+    plt.savefig(filename, dpi=150)
+    plt.close()
     print(f"  Saved t-SNE plot to {filename}")
 
-# --- 4. Evaluation & Visualization Logic ---
+# --- 4. Evaluation Logic ---
 def eval_task(backbone, config_name, tokenizer):
     print(f"\n>>> Running GUE Task: {config_name}")
     
@@ -207,44 +188,54 @@ def eval_task(backbone, config_name, tokenizer):
     except:
         num_classes = 2
 
-    # Collate
     def collate_fn(batch):
         seqs = [b[seq_key] for b in batch]
         labels = [int(b[label_key]) for b in batch]
         toks_list, pos_list = [], []
         for s in seqs:
             t = tokenizer.tokenize(s)
-            if len(t) > 512: t = t[:512]
-            elif len(t) < 512: t = torch.cat([t, torch.full((512 - len(t),), 4096)])
+            
+            # --- VERIFICATION: NO MASKING ---
+            # We are passing the tokens directly. 
+            # If the sequence is longer than 512, we truncate (standard context window).
+            # If it is shorter, we pad with 4096. 
+            # We DO NOT apply any [MASK] token replacement here.
+            
+            if len(t) > 512: 
+                t = t[:512]
+            elif len(t) < 512: 
+                t = torch.cat([t, torch.full((512 - len(t),), 4096)])
+            
             toks_list.append(t)
             pos_list.append(torch.arange(len(t)))
+            
         return torch.stack(toks_list), torch.stack(pos_list), torch.tensor(labels)
 
     train_dl = DataLoader(ds['train'], batch_size=32, shuffle=True, collate_fn=collate_fn, num_workers=2)
     test_split = 'test' if 'test' in ds else 'validation'
     test_dl = DataLoader(ds[test_split], batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=2)
 
-    # 1. Train Linear Probe (Quick)
+    # 1. Train Linear Probe
     probe = LinearProbe(512, num_classes).to("cuda")
     opt = torch.optim.AdamW(probe.parameters(), lr=1e-3)
     crit = nn.CrossEntropyLoss()
     
     backbone.eval()
-    for epoch in range(2): # 2 epochs enough for probe usually
+    for epoch in range(2): 
         probe.train()
         for toks, pos, y in tqdm.tqdm(train_dl, desc=f"  Ep {epoch}", leave=False):
             toks, pos, y = toks.to("cuda"), pos.to("cuda"), y.to("cuda")
             with torch.no_grad():
+                # return_feats=True bypasses the projection head, giving us the raw cls_token (dim 512)
                 feats = backbone(toks, pos, return_feats=True)
             loss = crit(probe(feats), y)
             opt.zero_grad()
             loss.backward()
             opt.step()
 
-    # 2. Extract Embeddings for t-SNE (Sampled)
-    # We use the test set for visualization to show generalization
+    # 2. Extract Embeddings (Sampled)
     all_feats, all_labels = [], []
-    sample_limit = 2000 # Max points for t-SNE
+    sample_limit = 2000 
     
     probe.eval()
     with torch.no_grad():
@@ -252,15 +243,11 @@ def eval_task(backbone, config_name, tokenizer):
             toks, pos = toks.to("cuda"), pos.to("cuda")
             feats = backbone(toks, pos, return_feats=True)
             
-            # Collect for Metrics
-            # (Skipping full metric calc loop for brevity, focusing on t-SNE extraction)
-            
-            # Collect for t-SNE
-            if len(all_feats) < sample_limit:
+            if len(all_feats) * 32 < sample_limit:
                 all_feats.append(feats.cpu().numpy())
                 all_labels.append(y.numpy())
             else:
-                break # collected enough
+                break 
     
     # 3. Generate t-SNE
     if all_feats:
@@ -282,8 +269,41 @@ if __name__ == "__main__":
     backbone.load_state_dict({k.replace("module.", ""): v for k,v in state.items()})
     
     tokenizer = KmerTokenizer(k=6)
+    
+    # --- TASK SORTING LOGIC ---
+    print("Fetching GUE configs...")
     configs = get_dataset_config_names("leannmlindsey/GUE")
     
-    # Run first 5 tasks as demo (or remove slice for all)
-    for config in configs[:5]: 
+    # Define keywords for human tasks (Promoters, Splice sites, Transcription Factors are usually human in GUE)
+    # We prioritize tasks that explicitly mention 'human' or use standard human genomic feature names.
+    human_keywords = ['human', 'prom', 'splice', 'tf']
+    
+    human_tasks = []
+    other_tasks = []
+    
+    for c in configs:
+        # Check if config matches human keywords AND is not explicitly mouse/yeast (unless it's TF which can be both)
+        is_human = any(k in c.lower() for k in human_keywords)
+        is_non_human = any(k in c.lower() for k in ['yeast', 'mouse', 'virus', 'covid', 'emp'])
+        
+        # Priority Logic: 
+        # 1. If it has a human keyword and NOT a non-human keyword -> Definitely Human
+        # 2. 'tf' is tricky (TF-M vs TF-H), but we will prioritize it generally.
+        if is_human and not (is_non_human and 'tf' not in c.lower()):
+            human_tasks.append(c)
+        else:
+            other_tasks.append(c)
+            
+    # Sort alphabetically for consistency
+    human_tasks.sort()
+    other_tasks.sort()
+    
+    # Combine: Human first
+    sorted_configs = human_tasks + other_tasks
+    
+    print(f"Identified {len(human_tasks)} likely human tasks: {human_tasks}")
+    print(f"Queued {len(sorted_configs)} total tasks.")
+
+    # Run top 5 tasks (now prioritized by human)
+    for config in sorted_configs[:5]: 
         eval_task(backbone, config, tokenizer)

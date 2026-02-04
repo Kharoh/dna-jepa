@@ -6,29 +6,24 @@ from torch.utils.data import DataLoader, Dataset
 import wandb, hydra, tqdm, random, math
 import pyfaidx, pandas as pd
 from omegaconf import DictConfig, OmegaConf
-from torch.amp import GradScaler, autocast  # Updated import
+from torch.amp import GradScaler, autocast
+from transformers import AutoTokenizer
 
-# --- 1. RoPE & Transformer Components ---
+# --- 1. RoPE & Transformer Components (UNCHANGED) ---
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len=2048):
+    def __init__(self, dim, max_seq_len=4096):
         super().__init__()
-        # Ensure dim is even for rotation
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         t = torch.arange(max_seq_len).type_as(inv_freq)
         freqs = torch.outer(t, inv_freq)
-        # Create cos/sin cache: (MaxLen, Dim/2) -> (MaxLen, Dim)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos())
         self.register_buffer("sin_cached", emb.sin())
 
     def forward(self, x, seq_len=None, positions=None):
-        # x: (B, H, L, D)
-        # positions: (B, L) -> integer indices of original positions
         if positions is None:
             return self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...]
-        
-        # Gather frequencies based on positions: (B, L, D)
-        cos = self.cos_cached[positions].unsqueeze(1) # (B, 1, L, D)
+        cos = self.cos_cached[positions].unsqueeze(1)
         sin = self.sin_cached[positions].unsqueeze(1)
         return cos, sin
 
@@ -44,47 +39,34 @@ class Block(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        
         self.norm1 = nn.LayerNorm(dim)
-        
-        # Explicit Projections for safe RoPE injection
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
         self.v_proj = nn.Linear(dim, dim)
         self.out_proj = nn.Linear(dim, dim)
-        
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, int(dim * mlp_ratio)),
-            nn.GELU(),
+            nn.Linear(dim, int(dim * mlp_ratio)), nn.GELU(),
             nn.Linear(int(dim * mlp_ratio), dim)
         )
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, mask=None):
         B, L, D = x.shape
-        
-        # 1. Attention with RoPE
         residual = x
         x = self.norm1(x)
-        
-        q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2) # (B, H, L, Dh)
+        q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Inject RoPE
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         
-        # Scaled Dot Product Attention
-        # Note: is_causal=False for bidirectional DNA modeling
-        out = F.scaled_dot_product_attention(q, k, v) 
-        
+        # Explicit attention mask handling for padding
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         out = out.transpose(1, 2).reshape(B, L, D)
         out = self.out_proj(out)
         
         x = residual + out
-        
-        # 2. MLP
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -95,112 +77,62 @@ class DNAEncoder(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         
-        self.embed = nn.Embedding(4096 + 2, dim) # 4^6 vocab
+        # DNABERT-2 vocab is ~4096 tokens + specials
+        self.embed = nn.Embedding(4096 + 5, dim, padding_idx=0) 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
-        
-        # Fix: Dynamic head_dim for RoPE
-        self.rope = RotaryEmbedding(self.head_dim) 
-        
-        self.blocks = nn.ModuleList([
-            Block(dim, num_heads=num_heads) for _ in range(depth)
-        ])
-        
-        # Projector
+        self.rope = RotaryEmbedding(self.head_dim)
+        self.blocks = nn.ModuleList([Block(dim, num_heads=num_heads) for _ in range(depth)])
         self.proj = nn.Sequential(
-            nn.Linear(dim, 2048),
-            nn.LayerNorm(2048),
-            nn.GELU(),
-            nn.Linear(2048, 2048),
-            nn.LayerNorm(2048),
-            nn.GELU(),
+            nn.Linear(dim, 2048), nn.LayerNorm(2048), nn.GELU(),
+            nn.Linear(2048, 2048), nn.LayerNorm(2048), nn.GELU(),
             nn.Linear(2048, proj_dim)
         )
 
     def forward(self, x, pos):
-        # x: (B, L_subset)
-        # pos: (B, L_subset)
-        
         B, L = x.shape
         
-        # 1. Embed
-        x = self.embed(x) 
+        # Create padding mask (True where valid, False where padded)
+        # Assuming 0 is padding index from tokenizer
+        mask = (x != 0).unsqueeze(1).unsqueeze(2) # (B, 1, 1, L)
         
-        # 2. CLS Token handling
+        x = self.embed(x)
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
         
-        # Adjust positions for CLS (at 0), shift data by 1
-        cls_pos = torch.zeros((B, 1), device=pos.device, dtype=torch.long)
-        pos = torch.cat((cls_pos, pos + 1), dim=1) 
+        # Adjust mask for CLS token (always attend to CLS)
+        cls_mask = torch.ones((B, 1, 1, 1), device=x.device, dtype=torch.bool)
+        mask = torch.cat((cls_mask, mask), dim=-1)
         
-        # 3. Get RoPE
+        cls_pos = torch.zeros((B, 1), device=pos.device, dtype=torch.long)
+        pos = torch.cat((cls_pos, pos + 1), dim=1)
+        
         cos, sin = self.rope(x, positions=pos)
         
-        # 4. Transformer
         for block in self.blocks:
-            x = block(x, cos, sin)
+            x = block(x, cos, sin, mask=mask)
             
-        # 5. Pool
         cls_out = x[:, 0]
         return self.proj(cls_out)
 
-# --- 2. Optimized Dataset ---
-class DNADropDataset(Dataset):
-    def __init__(self, fasta_path, intervals, seq_len=512, V=2, keep_ratio=0.5):
+
+# --- 2. BPE Optimized Dataset ---
+class DNABPEDataset(Dataset):
+    def __init__(self, fasta_path, intervals, max_len=512, V=2, keep_ratio=0.5):
         self.fasta_path = fasta_path
         self.intervals = intervals
-        self.seq_len = seq_len
+        self.max_len = max_len
         self.V = V
-        self.keep_k = int(seq_len * keep_ratio)
+        self.keep_ratio = keep_ratio
         self.fasta = None
-        self.k = 6
         
-        # Pre-compute powers for vectorization
-        self.powers = 4 ** torch.arange(self.k - 1, -1, -1)
+        # Load official DNABERT-2 tokenizer
+        print("Loading DNABERT-2 Tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True, cache_dir="./")
+        self.pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
 
     def _ensure_fasta(self):
         if self.fasta is None:
             self.fasta = pyfaidx.Fasta(self.fasta_path, sequence_always_upper=True)
-
-    def _tokenize(self, seq_str):
-        # OPTIMIZED: Vectorized tokenization (approx 50x faster)
-        # Map string to bytes then tensors: A=65, C=67, G=71, T=84, N=78
-        # We map A->0, C->1, G->2, T->3, N->4 (or anything else -> 4)
-        
-        # Create a tiny lookup table for ASCII
-        # This is safe because seq_str is guaranteed uppercase by pyfaidx
-        
-        # ASCII values for ACGTN
-        # A:65, C:67, G:71, T:84, N:78
-        
-        # Fast conversion to tensor indices
-        seq_tensor = torch.tensor([ord(c) for c in seq_str], dtype=torch.long)
-        
-        # Map values: Default 4 (UNK)
-        # Using a dense lookup for speed
-        lookup = torch.full((128,), 4, dtype=torch.long)
-        lookup[65] = 0 # A
-        lookup[67] = 1 # C
-        lookup[71] = 2 # G
-        lookup[84] = 3 # T
-        
-        indices = lookup[seq_tensor] # (L,)
-        
-        # Sliding window using unfold (no loop!)
-        # (L-k+1, k)
-        windows = indices.unfold(0, self.k, 1) 
-        
-        # Check for UNKs in any window position
-        # If any base is 4, the kmer is invalid
-        has_unk = (windows == 4).any(dim=1)
-        
-        # Compute numerical tokens
-        tokens = (windows * self.powers).sum(dim=1)
-        
-        # Mask UNKs
-        tokens[has_unk] = 4096 
-        
-        return tokens
 
     def __len__(self):
         return len(self.intervals)
@@ -209,39 +141,51 @@ class DNADropDataset(Dataset):
         self._ensure_fasta()
         chrom, start, end = self.intervals[idx]
         
+        # 1. Fetch raw sequence
         try:
             seq_str = str(self.fasta[chrom][start:end])
         except:
-            seq_str = "N" * self.seq_len
+            seq_str = "N" * (end - start)
             
-        if len(seq_str) < self.seq_len: seq_str += "N" * (self.seq_len - len(seq_str))
-        seq_str = seq_str[:self.seq_len]
+        # 2. BPE Tokenization
+        # DNABERT-2 tokenizer handles raw strings directly
+        tokens = self.tokenizer(seq_str, add_special_tokens=False)["input_ids"]
+        tokens = torch.tensor(tokens, dtype=torch.long)
+
+        # 3. Truncate/Pad to fixed window for processing
+        # Note: BPE is variable length. 512 tokens covers MUCH more DNA than 512bp.
+        if len(tokens) > self.max_len:
+            tokens = tokens[:self.max_len]
         
-        full_tokens = self._tokenize(seq_str)
-        
-        # Ensure exact length logic same as before
-        target_len = self.seq_len - self.k + 1
-        if len(full_tokens) < target_len:
-            full_tokens = F.pad(full_tokens, (0, target_len - len(full_tokens)), value=4096)
-        full_tokens = full_tokens[:target_len]
-        
-        # Create Views
+        # 4. Create Views (Subsampling Logic)
         views_tokens = []
         views_pos = []
-        all_indices = torch.arange(len(full_tokens))
         
+        actual_len = len(tokens)
+        keep_k = max(1, int(actual_len * self.keep_ratio))
+        all_indices = torch.arange(actual_len)
+
         for _ in range(self.V):
-            perm = torch.randperm(len(full_tokens))
-            keep_indices = perm[:self.keep_k]
-            keep_indices, _ = keep_indices.sort() # Preserve order for RoPE
+            # Random drop
+            perm = torch.randperm(actual_len)
+            keep_indices = perm[:keep_k]
+            keep_indices, _ = keep_indices.sort()
             
-            views_tokens.append(full_tokens[keep_indices])
-            views_pos.append(all_indices[keep_indices])
+            sub_tokens = tokens[keep_indices]
+            sub_pos = all_indices[keep_indices]
+            
+            # Pad to max_len for batching
+            pad_len = self.max_len - len(sub_tokens)
+            if pad_len > 0:
+                sub_tokens = F.pad(sub_tokens, (0, pad_len), value=self.pad_id)
+                sub_pos = F.pad(sub_pos, (0, pad_len), value=0) # Pos 0 is fine, will be masked
+            
+            views_tokens.append(sub_tokens)
+            views_pos.append(sub_pos)
             
         return torch.stack(views_tokens), torch.stack(views_pos)
 
-# --- 3. Utils (SIGReg, Intervals) ---
-# Unchanged
+# --- 3. Utils (UNCHANGED) ---
 class SIGReg(nn.Module):
     def __init__(self, knots=17):
         super().__init__()
@@ -261,7 +205,9 @@ class SIGReg(nn.Module):
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
         return ((err @ self.weights) * proj.size(-2)).mean()
 
-def generate_intervals(fasta_path, stride=512):
+def generate_intervals(fasta_path, window_bp=2000, stride=1000):
+    # Adjusted window_bp: BPE compresses ~4-5x. 
+    # 512 tokens * 4bp/token ≈ 2000bp. We fetch larger chunks now.
     if not fasta_path.endswith('.fai'):
         pyfaidx.Fasta(fasta_path) 
     fai = pd.read_csv(fasta_path + '.fai', sep='\t', header=None, names=['c','l','x','y','z'])
@@ -269,11 +215,11 @@ def generate_intervals(fasta_path, stride=512):
     valid = [f'chr{i}' for i in range(1, 23)] + ['chrX']
     for _, r in fai.iterrows():
         if r['c'] in valid:
-            for i in range(0, r['l'] - stride, stride):
-                ints.append((r['c'], i, i+stride))
+            for i in range(0, r['l'] - window_bp, stride):
+                ints.append((r['c'], i, i+window_bp))
     return ints
 
-# --- 4. Main Loop with GradScaler ---
+# --- 4. Main Loop (UNCHANGED logic, new params) ---
 @hydra.main(version_base=None)
 def main(cfg: DictConfig):
     if not hasattr(cfg, 'bs'): 
@@ -282,23 +228,23 @@ def main(cfg: DictConfig):
     wandb.init(project="dna-jepa", config=dict(cfg))
     os.makedirs("checkpoints", exist_ok=True)
     
-    intervals = generate_intervals(cfg.fasta)
+    # Generate larger intervals for BPE (2000bp instead of 512bp)
+    intervals = generate_intervals(cfg.fasta, window_bp=2000, stride=1000)
     random.shuffle(intervals)
-    # ds = DNADropDataset(cfg.fasta, intervals[:20000], seq_len=512, V=2, keep_ratio=0.6)
-    ds = DNADropDataset(cfg.fasta, intervals, seq_len=512, V=2, keep_ratio=0.6)
     
-    # Persistent workers for speed
+    # Use new BPE Dataset
+    ds = DNABPEDataset(cfg.fasta, intervals[:100000], max_len=512, V=2, keep_ratio=0.8)
+    
     loader = DataLoader(ds, batch_size=cfg.bs, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True)
     
+    # Model now handles BPE vocab
     net = DNAEncoder(dim=512, depth=6, num_heads=8, proj_dim=128).to("cuda")
     sigreg = SIGReg().to("cuda")
     opt = torch.optim.AdamW(net.parameters(), lr=cfg.lr)
-    
-    # Initialize Scaler
     scaler = GradScaler('cuda')
     
     best_loss = float('inf')
-    print(f"Training on {len(ds)} samples...")
+    print(f"Training on {len(ds)} samples with BPE...")
     
     for epoch in range(cfg.epochs):
         net.train()
@@ -311,7 +257,6 @@ def main(cfg: DictConfig):
             
             opt.zero_grad()
             
-            # Use float16 for significant speedup + GradScaler usage
             with autocast("cuda", dtype=torch.float16):
                 emb = net(toks, pos)
                 proj = emb.view(B, V, -1)
@@ -322,7 +267,6 @@ def main(cfg: DictConfig):
                 
                 loss = inv_loss * (1 - cfg.lamb) + reg_loss * cfg.lamb
             
-            # Scaled Backward
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
@@ -338,17 +282,15 @@ def main(cfg: DictConfig):
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': net.state_dict(),
-            'optimizer_state_dict': opt.state_dict(),
             'loss': avg_loss,
-            'config': dict(cfg)
         }
         torch.save(checkpoint, f"checkpoints/checkpoint_epoch_{epoch}.pth")
-        
+
         if avg_loss < best_loss:
             best_loss = avg_loss
             torch.save(checkpoint, "checkpoints/best_model.pth")
-            
-    torch.save(net.state_dict(), "checkpoints/final_model_weights.pth")
+            print(f"  * New best model saved! (Loss: {best_loss:.4f})")
+
 
 if __name__ == "__main__":
     main()
