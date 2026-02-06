@@ -11,3 +11,13 @@ python eval_gue.py --ckpt dna_lejepa_epoch_9.pth
 
 # GUE dataset
 https://huggingface.co/datasets/leannmlindsey/GUE
+
+# For math behind uncertainty : https://www.perplexity.ai/search/import-os-import-torch-import-0rhogsrCQ_aJNBPtuodHBA#0
+
+python gue_probe_explain.py \
+  --ckpt checkpoints/step_10000.pth \
+  --task human_tf_0 \
+  --tsne \
+  --mc_samples 512 \
+  --drop_prob 0.25 \
+  --outdir outputs_human_tf_0

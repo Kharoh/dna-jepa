@@ -5,3 +5,10 @@ hg38.fa.fai
 checkpoints
 models--zhihan1996--DNABERT-2-117M
 .locks
+leannmlindsey___gue
+embeddings
+plots
+dev.txt
+train.txt
+dnabert_2_pretrain.zip
+leannmlindsey___gue_*

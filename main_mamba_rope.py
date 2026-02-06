@@ -11,17 +11,44 @@ from datasets import load_dataset, get_dataset_config_names
 from sklearn.metrics import accuracy_score, matthews_corrcoef
 import numpy as np
 
-# --- 1. Architecture Components (ALiBi + GEGLU + DNAEncoder) ---
-class ALiBi(nn.Module):
-    def __init__(self, num_heads, max_seq_len=4096):
-        super().__init__()
-        slopes = torch.tensor([2 ** (-8 / num_heads * (i + 1)) for i in range(num_heads)])
-        positions = torch.arange(max_seq_len).unsqueeze(0) - torch.arange(max_seq_len).unsqueeze(1)
-        alibi = slopes.unsqueeze(-1).unsqueeze(-1) * positions.abs()
-        self.register_buffer("alibi", -alibi)
+try:
+    from mamba_ssm import Mamba
+except ImportError:
+    raise ImportError("Please install mamba-ssm: pip install mamba-ssm")
 
-    def forward(self, seq_len):
-        return self.alibi[:, :seq_len, :seq_len]
+
+# --- 1. Architecture Components (RoPE + GEGLU + BiMamba) ---
+class RoPE(nn.Module):
+    def __init__(self, dim, max_seq_len=4096, base=10000.0):
+        super().__init__()
+        self.dim = dim
+        theta = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("theta", theta)
+        
+        # Precompute for max sequence length
+        positions = torch.arange(max_seq_len).float()
+        freqs = torch.einsum("i,j->ij", positions, theta)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        self.register_buffer("cos_cached", emb.cos())
+        self.register_buffer("sin_cached", emb.sin())
+
+    def forward(self, x):
+        seq_len = x.shape[1]
+        cos = self.cos_cached[:seq_len]
+        sin = self.sin_cached[:seq_len]
+        
+        # Rotate: split x into pairs and apply rotation
+        x1 = x[..., : self.dim // 2]
+        x2 = x[..., self.dim // 2 : self.dim]
+        
+        # Apply rotation matrix
+        rotated = torch.cat([
+            x1 * cos[:, : self.dim // 2] - x2 * sin[:, : self.dim // 2],
+            x2 * cos[:, self.dim // 2 :] + x1 * sin[:, self.dim // 2 :]
+        ], dim=-1)
+        
+        return rotated
+
 
 class GEGLU(nn.Module):
     def __init__(self, dim_in, dim_out):
@@ -31,48 +58,59 @@ class GEGLU(nn.Module):
         x, gate = self.proj(x).chunk(2, dim=-1)
         return x * F.gelu(gate)
 
-class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4.0):
+
+class BiMambaBlock(nn.Module):
+    """
+    Bi-Directional Mamba Block.
+    Runs Mamba forward and backward (on flipped sequence) and combines outputs.
+    This restores the global receptive field needed for an Encoder.
+    """
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2, mlp_ratio=4.0):
         super().__init__()
-        assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}"
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
         self.norm1 = nn.LayerNorm(dim)
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
+        
+        # Two independent Mamba towers for Forward and Backward
+        self.mamba_fwd = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.mamba_bwd = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
+        
         self.norm2 = nn.LayerNorm(dim)
         hidden_dim = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(GEGLU(dim, hidden_dim), nn.Linear(hidden_dim, dim))
 
-    def forward(self, x, alibi_bias, padding_mask=None):
-        B, L, D = x.shape
+    def forward(self, x):
+        # 1. Bi-Directional Mamba Step
         residual = x
         x = self.norm1(x)
-        q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         
-        attn_mask = alibi_bias.unsqueeze(0)
-        if padding_mask is not None:
-            float_mask = torch.zeros_like(padding_mask, dtype=x.dtype).masked_fill(~padding_mask, float('-inf'))
-            attn_mask = attn_mask + float_mask
-            
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        out = out.transpose(1, 2).reshape(B, L, D)
-        out = self.out_proj(out)
-        return x + residual + self.mlp(self.norm2(out + residual))
+        # Forward pass
+        out_fwd = self.mamba_fwd(x)
+        
+        # Backward pass (flip seq, run mamba, flip back)
+        out_bwd = self.mamba_bwd(x.flip((1,))).flip((1,))
+        
+        # Combine (Simple addition is standard for BiMamba)
+        x = residual + (out_fwd + out_bwd)
+        
+        # 2. MLP Step
+        x = x + self.mlp(self.norm2(x))
+        return x
+
 
 class DNAEncoder(nn.Module):
-    def __init__(self, tokenizer, dim=512, depth=6, num_heads=8, proj_dim=128):
+    def __init__(self, tokenizer, dim=512, depth=6, d_state=16, d_conv=4, expand=2, proj_dim=128):
         super().__init__()
         self.dim = dim
         self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         self.embed = nn.Embedding(tokenizer.vocab_size, dim, padding_idx=self.pad_id)
+        self.rope = RoPE(dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
-        self.alibi = ALiBi(num_heads)
-        self.blocks = nn.ModuleList([Block(dim, num_heads=num_heads) for _ in range(depth)])
+        
+        # Swapped MambaBlock for BiMambaBlock
+        self.blocks = nn.ModuleList([
+            BiMambaBlock(dim, d_state=d_state, d_conv=d_conv, expand=expand) 
+            for _ in range(depth)
+        ])
+        
         self.proj = nn.Sequential(
             nn.Linear(dim, 2048), nn.BatchNorm1d(2048), nn.GELU(),
             nn.Linear(2048, 2048), nn.BatchNorm1d(2048), nn.GELU(),
@@ -81,20 +119,19 @@ class DNAEncoder(nn.Module):
 
     def forward(self, x, return_feats=False):
         B, L = x.shape
-        padding_mask = (x != self.pad_id).unsqueeze(1).unsqueeze(2)
         x = self.embed(x)
+        x = self.rope(x)
+        
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
-        cls_mask = torch.ones((B, 1, 1, 1), device=x.device, dtype=torch.bool)
-        padding_mask = torch.cat((cls_mask, padding_mask), dim=-1)
-        alibi_bias = self.alibi(L + 1)
         
         for block in self.blocks:
-            x = block(x, alibi_bias, padding_mask)
+            x = block(x)
             
         cls_out = x[:, 0]
         if return_feats: return cls_out
         return self.proj(cls_out)
+
 
 # --- 2. Dataset & Losses ---
 class DNATextDataset(Dataset):
@@ -174,6 +211,7 @@ class SIGReg(nn.Module):
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
         return ((err @ self.weights) * proj.size(-2)).mean()
 
+
 # --- 3. GUE Evaluation Logic ---
 class LinearProbe(nn.Module):
     def __init__(self, input_dim, num_classes):
@@ -181,6 +219,7 @@ class LinearProbe(nn.Module):
         self.bn = nn.BatchNorm1d(input_dim)
         self.linear = nn.Linear(input_dim, num_classes)
     def forward(self, x): return self.linear(self.bn(x))
+
 
 def extract_features(model, loader, device="cuda"):
     model.eval()
@@ -192,6 +231,7 @@ def extract_features(model, loader, device="cuda"):
             all_feats.append(feats.cpu())
             all_labels.append(y)
     return torch.cat(all_feats), torch.cat(all_labels)
+
 
 def eval_gue(backbone, tokenizer, device="cuda", task_limit=3):
     """Run evaluation on a few GUE tasks."""
@@ -257,6 +297,7 @@ def eval_gue(backbone, tokenizer, device="cuda", task_limit=3):
             
     return results
 
+
 def load_checkpoint(checkpoint_path, net, opt=None, device="cuda"):
     """
     Load a checkpoint to resume training.
@@ -293,16 +334,17 @@ def load_checkpoint(checkpoint_path, net, opt=None, device="cuda"):
     return start_step, loaded_config
 
 
+
 # --- 4. Main Training Loop ---
 @hydra.main(version_base=None, config_path=None)
 def main(cfg: DictConfig):
     if not hasattr(cfg, 'bs'):
         cfg = OmegaConf.create({
-            "bs": 64, "lr": 2e-4, "epochs": 50, 
+            "bs": 32, "lr": 2e-4, "epochs": 50, 
             "train_file": "train.txt", "dev_file": "dev.txt",
             "lamb": 0.1, "V": 2, "proj_dim": 128, "keep_ratio": 0.7, "max_len": 512,
             "eval_every": 10000,  # Evaluate every 1000 steps
-            "resume_from": "./checkpoints/step_60000.pth"
+            "resume_from": None
         })
     
     wandb.init(project="dna-jepa", config=dict(cfg))
@@ -310,16 +352,18 @@ def main(cfg: DictConfig):
     
     tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True, cache_dir="./")
     
-    # 512 dim, 8 heads -> head_dim=64 (Divisible!)
-    net = DNAEncoder(tokenizer, dim=512, depth=6, num_heads=8, proj_dim=cfg.proj_dim).to("cuda")
+    # 512 dim, d_state=16, d_conv=4 are standard Mamba defaults
+    net = DNAEncoder(tokenizer, dim=512, depth=6, d_state=16, d_conv=4, expand=2, proj_dim=cfg.proj_dim).to("cuda")
     sigreg = SIGReg().to("cuda")
     opt = torch.optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=5e-2, fused=True)
+
 
     start_step = 0
     if cfg.resume_from is not None:
         start_step, loaded_cfg = load_checkpoint(cfg.resume_from, net, opt, device="cuda")
         if loaded_cfg:
             print(f"  Previous config: {loaded_cfg}")
+
 
     net = torch.compile(net, mode='max-autotune')
     scaler = GradScaler('cuda')
@@ -351,7 +395,7 @@ def main(cfg: DictConfig):
             scaler.step(opt)
             scaler.update()
 
-            wandb.log({"train/loss": loss.item(), "train/inv": inv_loss.item(), "train/reg": reg_loss.item()}, step=global_step)
+            wandb.log({"train/loss": loss.item(), "train/inv": inv_loss.item(), "train/reg": reg_loss.item(), "global_step": global_step})
             global_step += 1
             
             # --- Periodic Evaluation & Checkpointing ---
@@ -373,6 +417,7 @@ def main(cfg: DictConfig):
                 wandb.log({f"gue/{k}": v for k, v in gue_results.items()})
                 
                 net.train() # Switch back to train mode
+
 
 if __name__ == "__main__":
     main()

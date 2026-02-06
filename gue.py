@@ -1,17 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from datasets import load_dataset, get_dataset_config_names
 import numpy as np
-from sklearn.metrics import accuracy_score, matthews_corrcoef
+from sklearn.metrics import accuracy_score
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 import seaborn as sns
 import tqdm
 import argparse
 import os
-import json
+from transformers import AutoTokenizer
 
 # Ensure matplotlib backend is non-interactive for servers
 import matplotlib
@@ -101,23 +101,6 @@ class DNAEncoder(nn.Module):
         return self.proj(cls_out)
 
 # --- 2. Utils ---
-class KmerTokenizer:
-    def __init__(self, k=6):
-        self.k = k
-        self.powers = 4 ** torch.arange(k - 1, -1, -1)
-
-    def tokenize(self, seq_str):
-        seq_tensor = torch.tensor([ord(c) for c in seq_str.upper()], dtype=torch.long)
-        lookup = torch.full((128,), 4, dtype=torch.long)
-        lookup[65], lookup[67], lookup[71], lookup[84] = 0, 1, 2, 3
-        indices = lookup[seq_tensor]
-        if len(indices) < self.k: return torch.tensor([4096], dtype=torch.long)
-        windows = indices.unfold(0, self.k, 1)
-        has_unk = (windows == 4).any(dim=1)
-        tokens = (windows * self.powers).sum(dim=1)
-        tokens[has_unk] = 4096
-        return tokens
-
 class LinearProbe(nn.Module):
     def __init__(self, input_dim, num_classes):
         super().__init__()
@@ -166,7 +149,22 @@ def create_tsne_plot(embeddings, labels, task_name, output_dir="plots"):
     plt.close()
     print(f"  Saved t-SNE plot to {filename}")
 
-# --- 4. Evaluation Logic ---
+# --- 4. Feature Extraction Helper ---
+def extract_features(model, loader, device="cuda", desc="Extracting features"):
+    model.eval()
+    all_feats = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for toks, pos, y in tqdm.tqdm(loader, desc=desc, leave=False):
+            toks, pos = toks.to(device), pos.to(device)
+            feats = model(toks, pos, return_feats=True)
+            all_feats.append(feats.cpu())
+            all_labels.append(y.cpu())
+            
+    return torch.cat(all_feats), torch.cat(all_labels)
+
+# --- 5. Evaluation Logic ---
 def eval_task(backbone, config_name, tokenizer):
     print(f"\n>>> Running GUE Task: {config_name}")
     
@@ -188,68 +186,101 @@ def eval_task(backbone, config_name, tokenizer):
     except:
         num_classes = 2
 
+    # --- FIXED COLLATE_FN ---
     def collate_fn(batch):
         seqs = [b[seq_key] for b in batch]
         labels = [int(b[label_key]) for b in batch]
+        
         toks_list, pos_list = [], []
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        
         for s in seqs:
-            t = tokenizer.tokenize(s)
-            
-            # --- VERIFICATION: NO MASKING ---
-            # We are passing the tokens directly. 
-            # If the sequence is longer than 512, we truncate (standard context window).
-            # If it is shorter, we pad with 4096. 
-            # We DO NOT apply any [MASK] token replacement here.
+            encoded = tokenizer(s, add_special_tokens=False)
+            t = torch.tensor(encoded["input_ids"], dtype=torch.long)
             
             if len(t) > 512: 
                 t = t[:512]
             elif len(t) < 512: 
-                t = torch.cat([t, torch.full((512 - len(t),), 4096)])
+                padding = torch.full((512 - len(t),), pad_id, dtype=torch.long)
+                t = torch.cat([t, padding])
             
             toks_list.append(t)
             pos_list.append(torch.arange(len(t)))
             
         return torch.stack(toks_list), torch.stack(pos_list), torch.tensor(labels)
 
-    train_dl = DataLoader(ds['train'], batch_size=32, shuffle=True, collate_fn=collate_fn, num_workers=2)
+    # 1. Create Loaders
+    train_dl = DataLoader(ds['train'], batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=2)
     test_split = 'test' if 'test' in ds else 'validation'
     test_dl = DataLoader(ds[test_split], batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=2)
 
-    # 1. Train Linear Probe
+    # 2. Pre-compute Training Features (Optimization)
+    print("  Pre-computing training embeddings...")
+    train_feats, train_labels = extract_features(backbone, train_dl, desc="Caching Train")
+    
+    # Save to disk (Requirement: Save embeddings)
+    os.makedirs("embeddings", exist_ok=True)
+    torch.save({"embeddings": train_feats, "labels": train_labels}, f"embeddings/{config_name}_train.pt")
+    
+    # Create cached dataloader for fast training
+    cached_train_ds = TensorDataset(train_feats, train_labels)
+    cached_train_dl = DataLoader(cached_train_ds, batch_size=32, shuffle=True)
+
+    # 3. Train Linear Probe
     probe = LinearProbe(512, num_classes).to("cuda")
     opt = torch.optim.AdamW(probe.parameters(), lr=1e-3)
     crit = nn.CrossEntropyLoss()
     
-    backbone.eval()
-    for epoch in range(2): 
+    for epoch in range(10): # Increased epochs because it's super fast now
         probe.train()
-        for toks, pos, y in tqdm.tqdm(train_dl, desc=f"  Ep {epoch}", leave=False):
-            toks, pos, y = toks.to("cuda"), pos.to("cuda"), y.to("cuda")
-            with torch.no_grad():
-                # return_feats=True bypasses the projection head, giving us the raw cls_token (dim 512)
-                feats = backbone(toks, pos, return_feats=True)
-            loss = crit(probe(feats), y)
+        epoch_preds, epoch_targets = [], []
+        
+        for feats, y in cached_train_dl:
+            feats, y = feats.to("cuda"), y.to("cuda")
+            logits = probe(feats)
+            loss = crit(logits, y)
+            
+            preds = torch.argmax(logits, dim=1)
+            epoch_preds.extend(preds.cpu().numpy())
+            epoch_targets.extend(y.cpu().numpy())
+
             opt.zero_grad()
             loss.backward()
             opt.step()
+        
+        train_acc = accuracy_score(epoch_targets, epoch_preds)
+        print(f"  Epoch {epoch} Train Accuracy: {train_acc:.4f}")
 
-    # 2. Extract Embeddings (Sampled)
-    all_feats, all_labels = [], []
-    sample_limit = 2000 
-    
+    # 4. Evaluation (Extract features on fly for test to save memory, or cache if preferred)
     probe.eval()
+    test_preds, test_targets = [], []
+    all_feats, all_labels = [], [] # For t-SNE
+    sample_limit = 2000
+    
+    print("  Evaluating on test set...")
     with torch.no_grad():
-        for toks, pos, y in test_dl:
+        for toks, pos, y in tqdm.tqdm(test_dl, desc="Testing", leave=False):
             toks, pos = toks.to("cuda"), pos.to("cuda")
+            
+            # Compute embeddings
             feats = backbone(toks, pos, return_feats=True)
             
+            # Predict
+            logits = probe(feats)
+            preds = torch.argmax(logits, dim=1)
+            
+            test_preds.extend(preds.cpu().numpy())
+            test_targets.extend(y.numpy())
+            
+            # Store subset for t-SNE
             if len(all_feats) * 32 < sample_limit:
                 all_feats.append(feats.cpu().numpy())
                 all_labels.append(y.numpy())
-            else:
-                break 
+
+    test_acc = accuracy_score(test_targets, test_preds)
+    print(f"  Task: {config_name} | Test Accuracy: {test_acc:.4f}")
     
-    # 3. Generate t-SNE
+    # 5. Generate t-SNE
     if all_feats:
         embeddings = np.concatenate(all_feats, axis=0)
         labels = np.concatenate(all_labels, axis=0)
@@ -257,53 +288,45 @@ def eval_task(backbone, config_name, tokenizer):
         
     return "Done"
 
-# --- 5. Main ---
+# --- 6. Main ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, required=True)
     args = parser.parse_args()
 
-    backbone = DNAEncoder(dim=512, depth=6, num_heads=8, proj_dim=128).to("cuda")
+    backbone = DNAEncoder(dim=512, depth=6, num_heads=8, proj_dim=128)
+    backbone.embed = nn.Embedding(4096 + 5, 512, padding_idx=0) 
+    backbone.rope = RotaryEmbedding(512 // 8, max_seq_len=4096) 
+    backbone = backbone.to("cuda")
+    
     ckpt = torch.load(args.ckpt)
     state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
     backbone.load_state_dict({k.replace("module.", ""): v for k,v in state.items()})
     
-    tokenizer = KmerTokenizer(k=6)
+    tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True)
     
-    # --- TASK SORTING LOGIC ---
     print("Fetching GUE configs...")
     configs = get_dataset_config_names("leannmlindsey/GUE")
     
-    # Define keywords for human tasks (Promoters, Splice sites, Transcription Factors are usually human in GUE)
-    # We prioritize tasks that explicitly mention 'human' or use standard human genomic feature names.
     human_keywords = ['human', 'prom', 'splice', 'tf']
-    
     human_tasks = []
     other_tasks = []
     
     for c in configs:
-        # Check if config matches human keywords AND is not explicitly mouse/yeast (unless it's TF which can be both)
         is_human = any(k in c.lower() for k in human_keywords)
         is_non_human = any(k in c.lower() for k in ['yeast', 'mouse', 'virus', 'covid', 'emp'])
         
-        # Priority Logic: 
-        # 1. If it has a human keyword and NOT a non-human keyword -> Definitely Human
-        # 2. 'tf' is tricky (TF-M vs TF-H), but we will prioritize it generally.
         if is_human and not (is_non_human and 'tf' not in c.lower()):
             human_tasks.append(c)
         else:
             other_tasks.append(c)
             
-    # Sort alphabetically for consistency
     human_tasks.sort()
     other_tasks.sort()
-    
-    # Combine: Human first
     sorted_configs = human_tasks + other_tasks
     
     print(f"Identified {len(human_tasks)} likely human tasks: {human_tasks}")
     print(f"Queued {len(sorted_configs)} total tasks.")
 
-    # Run top 5 tasks (now prioritized by human)
     for config in sorted_configs[:5]: 
         eval_task(backbone, config, tokenizer)

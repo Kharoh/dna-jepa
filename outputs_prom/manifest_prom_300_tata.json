@@ -1,0 +1,38 @@
+{
+  "ckpt": "checkpoints/step_20000.pth",
+  "task": "prom_300_tata",
+  "acc": 0.7308319738988581,
+  "probe": "outputs_prom/probe_prom_300_tata.pth",
+  "examples": [
+    {
+      "idx": 453,
+      "json": "outputs_prom/explain_prom_300_tata_453.json",
+      "png": "outputs_prom/explain_prom_300_tata_453.png"
+    },
+    {
+      "idx": 52,
+      "json": "outputs_prom/explain_prom_300_tata_52.json",
+      "png": "outputs_prom/explain_prom_300_tata_52.png"
+    },
+    {
+      "idx": 535,
+      "json": "outputs_prom/explain_prom_300_tata_535.json",
+      "png": "outputs_prom/explain_prom_300_tata_535.png"
+    },
+    {
+      "idx": 468,
+      "json": "outputs_prom/explain_prom_300_tata_468.json",
+      "png": "outputs_prom/explain_prom_300_tata_468.png"
+    },
+    {
+      "idx": 55,
+      "json": "outputs_prom/explain_prom_300_tata_55.json",
+      "png": "outputs_prom/explain_prom_300_tata_55.png"
+    },
+    {
+      "idx": 62,
+      "json": "outputs_prom/explain_prom_300_tata_62.json",
+      "png": "outputs_prom/explain_prom_300_tata_62.png"
+    }
+  ]
+}
