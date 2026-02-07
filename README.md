@@ -1,6 +1,11 @@
 # 1. Install libraries
 pip install torch torchvision transformers wandb hydra-core pyfaidx pandas numpy
 
+# Pretraining data (rest is obsolote) from DNABERT
+
+This is what to download, skip the rest :
+gdown 1dSXJfwGpDSJ59ry9KAp8SugQLK35V83f
+
 # 2. Download hg38 Primary Assembly (approx 3GB compressed, 3GB uncompressed)
 wget https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_45/GRCh38.primary_assembly.genome.fa.gz
 gunzip GRCh38.primary_assembly.genome.fa.gz
