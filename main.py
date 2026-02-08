@@ -17,6 +17,8 @@ import torch._inductor.config
 torch._dynamo.config.capture_scalar_outputs = True
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 # --- Flash Attention Imports ---
 try:
     from flash_attn import flash_attn_varlen_func
@@ -216,9 +218,11 @@ class DNAJEPADataset(Dataset):
         self.num_views = num_views
         self.mask_ratio = mask_ratio
 
-        print(f"Loading dataset from {txt_path}...")
-        with open(txt_path, "r") as f:
-            self.lines = [line.strip() for line in f if line.strip()]
+        print(f"Loading dataset from {txt_path} using Memory Mapping...")
+        # Use load_dataset to memory-map the file instead of reading into RAM
+        # keep_in_memory=False ensures it stays on disk
+        dataset = load_dataset("text", data_files={"train": txt_path}, split="train", keep_in_memory=False, cache_dir="./")
+        self.lines = dataset  
         print(f"Loaded {len(self.lines)} sequences.")
 
     def __len__(self):
@@ -259,7 +263,7 @@ class DNAJEPADataset(Dataset):
         return mask
 
     def __getitem__(self, idx):
-        text = self.lines[idx]
+        text = self.lines[idx]['text']
 
         # Generate V different views (same tokenization, different masks)
         views = []
@@ -460,10 +464,10 @@ def main(cfg: DictConfig):
         train_ds,
         batch_size=cfg.bs,
         shuffle=True,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
         persistent_workers=True,
-        prefetch_factor=3
+        prefetch_factor=2
     )
 
     global_step = start_step
