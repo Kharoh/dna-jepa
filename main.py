@@ -148,9 +148,11 @@ class DNAEncoder(nn.Module):
         self.proj = nn.Sequential(
             nn.Linear(dim, 2048),
             nn.LayerNorm(2048), # Changed from BatchNorm1d
+            # nn.BatchNorm1d(2048),
             nn.GELU(),
             nn.Linear(2048, 2048),
             nn.LayerNorm(2048), # Changed from BatchNorm1d
+            # nn.BatchNorm1d(2048),
             nn.GELU(),
             nn.Linear(2048, proj_dim)
         )
@@ -212,11 +214,17 @@ class DNAEncoder(nn.Module):
 # --- 2. Dataset (no BPE Dropout, keep block masking) ---
 
 class DNAJEPADataset(Dataset):
-    def __init__(self, txt_path, tokenizer, max_len=512, num_views=2, mask_ratio=0.3):
+    def __init__(self, txt_path, tokenizer, max_len=512, num_views=2, mask_ratio=0.3, use_rc=True):
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.num_views = num_views
         self.mask_ratio = mask_ratio
+        self.use_rc = use_rc and (num_views >= 2)
+
+        self.rc_map = {
+            'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C', 'N': 'N',
+            'a': 't', 't': 'a', 'c': 'g', 'g': 'c', 'n': 'n'
+        }
 
         print(f"Loading dataset from {txt_path} using Memory Mapping...")
         # Use load_dataset to memory-map the file instead of reading into RAM
@@ -224,6 +232,11 @@ class DNAJEPADataset(Dataset):
         dataset = load_dataset("text", data_files={"train": txt_path}, split="train", keep_in_memory=False, cache_dir="./")
         self.lines = dataset  
         print(f"Loaded {len(self.lines)} sequences.")
+
+    def _reverse_complement(self, text):
+        """Return reverse complement of a DNA string."""
+        text = text.strip()
+        return ''.join(self.rc_map.get(base, base) for base in reversed(text))
 
     def __len__(self):
         return len(self.lines)
@@ -267,8 +280,13 @@ class DNAJEPADataset(Dataset):
 
         # Generate V different views (same tokenization, different masks)
         views = []
-        for _ in range(self.num_views):
-            ids = self._encode_no_dropout(text)
+        for v in range(self.num_views):
+            if v == 1 and self.use_rc and random.random() < 0.5: # Apply reverse complement to the second view with 50% chance
+                src_text = self._reverse_complement(text)
+            else:
+                src_text = text
+
+            ids = self._encode_no_dropout(src_text)
             ids = ids[:self.max_len]
             padding = [self.tokenizer.pad_token_id] * (self.max_len - len(ids))
             view_tokens = torch.tensor(ids + padding, dtype=torch.long)
@@ -402,7 +420,7 @@ def load_checkpoint(checkpoint_path, net, opt=None, device="cuda"):
         else:
             new_state_dict[k] = v
 
-    net.load_state_dict(new_state_dict)
+    net.load_state_dict(new_state_dict, strict=False)
     print(f"  ✓ Loaded model weights")
 
     if opt is not None and 'optimizer_state_dict' in checkpoint:
@@ -421,8 +439,9 @@ def main(cfg: DictConfig):
         cfg = OmegaConf.create({
             "bs": 128, "lr": 2e-4, "epochs": 50,
             "train_file": "train.txt", "dev_file": "dev.txt",
-            "lamb": 0.05, "V": 3, "proj_dim": 128,
+            "lamb": 0.1, "V": 2, "proj_dim": 64,
             "max_len": 512, "eval_every": 10000,
+            # "resume_from": "./checkpoints/step_30000.pth",
             "resume_from": None,
             "model_dim": 512,
             "depth": 6,
@@ -449,7 +468,7 @@ def main(cfg: DictConfig):
     if cfg.resume_from is not None:
         start_step, loaded_cfg = load_checkpoint(cfg.resume_from, net, opt, device="cuda")
 
-    net = torch.compile(net, mode='max-autotune')
+    # net = torch.compile(net, mode='max-autotune')
     scaler = GradScaler('cuda')
 
     train_ds = DNAJEPADataset(
@@ -457,7 +476,8 @@ def main(cfg: DictConfig):
         tokenizer,
         cfg.max_len,
         num_views=cfg.V,
-        mask_ratio=cfg.mask_ratio
+        mask_ratio=cfg.mask_ratio,
+        use_rc=True
     )
 
     train_loader = DataLoader(
