@@ -11,6 +11,12 @@ from datasets import load_dataset
 from sklearn.metrics import accuracy_score, matthews_corrcoef
 import numpy as np
 
+import glob
+import itertools
+from pathlib import Path
+from torch.utils.data import IterableDataset, get_worker_info
+
+
 import torch._dynamo
 import torch._inductor.config
 
@@ -212,6 +218,163 @@ class DNAEncoder(nn.Module):
 
 
 # --- 2. Dataset (no BPE Dropout, keep block masking) ---
+
+class StratifiedDNAJEPAIterableDataset(IterableDataset):
+    """
+    Streams samples from multiple cluster text files with one cursor per file.
+    Sampling is uniform over clusters by round-robin over files (with per-epoch shuffle of file order).
+    """
+
+    def __init__(
+        self,
+        cluster_files,
+        tokenizer,
+        max_len=512,
+        num_views=2,
+        mask_ratio=0.3,
+        use_rc=True,
+        shuffle_clusters_each_iter=True,
+    ):
+        super().__init__()
+        self.cluster_files = [str(p) for p in cluster_files]
+        if len(self.cluster_files) == 0:
+            raise ValueError("No cluster .txt files found. Check your glob/path.")
+
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.num_views = num_views
+        self.mask_ratio = mask_ratio
+        self.use_rc = use_rc and (num_views >= 2)
+        self.shuffle_clusters_each_iter = shuffle_clusters_each_iter
+
+        self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+        self.rc_map = {
+            'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C', 'N': 'N',
+            'a': 't', 't': 'a', 'c': 'g', 'g': 'c', 'n': 'n'
+        }
+
+        print(f"Loaded {len(self.cluster_files)} cluster files.")
+
+    def _reverse_complement(self, text: str) -> str:
+        text = text.strip()
+        return ''.join(self.rc_map.get(base, base) for base in reversed(text))
+
+    def _encode_no_dropout(self, text: str):
+        return self.tokenizer.encode(
+            text,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_len
+        )
+
+    def _get_block_mask(self, length, mask_ratio=0.3):
+        mask = torch.ones(length, dtype=torch.bool)
+        if length < 5:
+            return mask
+
+        num_to_mask = int(length * mask_ratio)
+        num_masked = 0
+        avg_block = max(3, length // 8)
+
+        attempts = 0
+        while num_masked < num_to_mask and attempts < 20:
+            block_size = random.randint(avg_block // 2, avg_block * 2)
+            if num_masked + block_size > num_to_mask:
+                block_size = num_to_mask - num_masked
+
+            start = random.randint(0, max(0, length - block_size))
+
+            if not mask[start]:
+                attempts += 1
+                continue
+
+            mask[start:start + block_size] = False
+            num_masked += block_size
+
+        return mask
+
+    def _make_views(self, text: str):
+        # Generate V different views (same tokenization, different masks)
+        views = []
+        for v in range(self.num_views):
+            if v == 1 and self.use_rc and random.random() < 0.5:
+                src_text = self._reverse_complement(text)
+            else:
+                src_text = text
+
+            ids = self._encode_no_dropout(src_text)
+            ids = ids[:self.max_len]
+            padding = [self.pad_id] * (self.max_len - len(ids))
+            view_tokens = torch.tensor(ids + padding, dtype=torch.long)
+
+            seq_len = min(len(ids), self.max_len)
+            mask_content = self._get_block_mask(seq_len, mask_ratio=self.mask_ratio)
+            full_mask = torch.ones(self.max_len, dtype=torch.bool)
+            full_mask[:seq_len] = mask_content
+
+            masked_view = view_tokens.clone()
+            masked_view[~full_mask] = self.pad_id
+            views.append(masked_view)
+
+        return torch.stack(views)  # (V, L)
+
+    def __iter__(self):
+        # Multi-worker: shard files across workers so we don't open all files in every worker.
+        info = get_worker_info()
+        if info is None:
+            worker_id, num_workers = 0, 1
+        else:
+            worker_id, num_workers = info.id, info.num_workers
+
+        my_files = self.cluster_files[worker_id::num_workers]
+        if len(my_files) == 0:
+            return iter([])
+
+        # Per-iterator randomness (DataLoader seeds each worker; torch.initial_seed differs per worker).
+        rng = random.Random(torch.initial_seed() % (2**32))
+
+        # Open file handles (cursors)
+        fps = []
+        try:
+            for p in my_files:
+                f = open(p, "r")
+                # Optional: randomize starting point a bit (cheap “shuffle” for big files)
+                try:
+                    size = os.path.getsize(p)
+                    if size > 1024:
+                        f.seek(rng.randint(0, size - 1))
+                        f.readline()  # drop partial line
+                except OSError:
+                    pass
+                fps.append(f)
+
+            order = list(range(len(fps)))
+            if self.shuffle_clusters_each_iter:
+                rng.shuffle(order)
+
+            # Round-robin forever across clusters => globally uniform over clusters (not per-batch).
+            for j in itertools.cycle(order):
+                line = fps[j].readline()
+                if line == "":  # EOF -> rewind
+                    fps[j].seek(0)
+                    line = fps[j].readline()
+                    if line == "":
+                        continue  # empty file, skip
+
+                text = line.strip()
+                if not text:
+                    continue
+
+                yield self._make_views(text)
+
+        finally:
+            for f in fps:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+
 
 class DNAJEPADataset(Dataset):
     def __init__(self, txt_path, tokenizer, max_len=512, num_views=2, mask_ratio=0.3, use_rc=True):
@@ -440,13 +603,16 @@ def main(cfg: DictConfig):
             "bs": 128, "lr": 2e-4, "epochs": 50,
             "train_file": "train.txt", "dev_file": "dev.txt",
             "lamb": 0.1, "V": 2, "proj_dim": 64,
-            "max_len": 512, "eval_every": 10000,
+            "max_len": 512, 
             # "resume_from": "./checkpoints/step_30000.pth",
             "resume_from": None,
             "model_dim": 512,
             "depth": 6,
             "heads": 8,
-            "mask_ratio": 0.3
+            "mask_ratio": 0.3,
+            "train_clusters_glob": "./stratification/*m_cluster*.txt",     # e.g. "./stratification/0m_cluster*.txt"
+            "steps_per_epoch": 2000,         # control epoch length since IterableDataset is infinite
+            "eval_every": 10000,
         })
 
     wandb.init(project="dna-jepa", config=dict(cfg))
@@ -471,23 +637,35 @@ def main(cfg: DictConfig):
     # net = torch.compile(net, mode='max-autotune')
     scaler = GradScaler('cuda')
 
-    train_ds = DNAJEPADataset(
-        cfg.train_file,
-        tokenizer,
-        cfg.max_len,
-        num_views=cfg.V,
-        mask_ratio=cfg.mask_ratio,
-        use_rc=True
-    )
+    if cfg.train_clusters_glob is not None:
+        cluster_files = sorted(glob.glob(cfg.train_clusters_glob))
+        train_ds = StratifiedDNAJEPAIterableDataset(
+            cluster_files,
+            tokenizer,
+            max_len=cfg.max_len,
+            num_views=cfg.V,
+            mask_ratio=cfg.mask_ratio,
+            use_rc=True
+        )
+    else:
+        train_ds = DNAJEPADataset(
+            cfg.train_file,
+            tokenizer,
+            cfg.max_len,
+            num_views=cfg.V,
+            mask_ratio=cfg.mask_ratio,
+            use_rc=True
+        )
 
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.bs,
-        shuffle=True,
+        shuffle=False,              # IMPORTANT for IterableDataset
         num_workers=2,
         pin_memory=True,
         persistent_workers=True,
-        prefetch_factor=2
+        prefetch_factor=2,
+        drop_last=True
     )
 
     global_step = start_step
@@ -495,10 +673,18 @@ def main(cfg: DictConfig):
 
     for epoch in range(cfg.epochs):
         net.train()
-        for i, batch_views in enumerate(tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}")):
+        data_it = iter(train_loader)
+        for i in tqdm.tqdm(range(cfg.steps_per_epoch), desc=f"Epoch {epoch+1}"):
+            try:
+                batch_views = next(data_it)
+            except StopIteration:
+                data_it = iter(train_loader)
+                batch_views = next(data_it)
+
             # batch_views: (B, V, L)
             batch_views = batch_views.to("cuda", non_blocking=True)
             B, V, L = batch_views.shape
+
 
             # Flatten to (B*V, L)
             flat_input = batch_views.reshape(B * V, L)
