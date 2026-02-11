@@ -26,3 +26,20 @@ python gue_probe_explain.py \
   --mc_samples 512 \
   --drop_prob 0.25 \
   --outdir outputs_human_tf_0
+
+# For orthologous sequences
+
+## Install pigz if needed
+sudo apt install pigz
+
+## Download (~34GB, will take 10-30 min depending on connection)
+wget https://huggingface.co/datasets/lpigou/89.zarr/resolve/main/89.zarr.tar.gz
+
+## Extract (much faster than 7z - minutes instead of hours)
+unpigz < 89.zarr.tar.gz | tar -x
+
+## Clean up
+rm 89.zarr.tar.gz
+
+## Verify
+ls -lh 89.zarr/

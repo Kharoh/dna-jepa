@@ -200,12 +200,11 @@ class ParallelOrthologHelper:
     def __init__(
         self,
         bed_file,
-        msa_path="zip:///::https://huggingface.co/datasets/songlab/multiz100way/resolve/main/89.zarr.zip",
-        window_size=90,
+        # msa_path="zip:///::https://huggingface.co/datasets/songlab/multiz100way/resolve/main/89.zarr.zip",
+        msa_path="./89.zarr", # For local
         min_alignment_quality=0.25,
-        max_workers=4,  # Number of parallel threads
+        max_workers=32,  # Number of parallel threads
     ):
-        self.window_size = window_size
         self.min_alignment_quality = min_alignment_quality
         self.max_workers = max_workers
         
@@ -292,39 +291,9 @@ class ParallelOrthologHelper:
         else:
             return str(arr)
     
-    def _fetch_msa_window(self, coord, chunk_start, chunk_end):
-        """Fetch a single MSA window (to be parallelized)."""
-        try:
-            with self.stats_lock:
-                self.stats['total_msa_queries'] += 1
-            
-            msa = self.genome_msa.get_msa(
-                chrom=coord['chrom'],
-                start=chunk_start,
-                end=chunk_end,
-                strand=coord['strand'],
-                tokenize=False
-            )
-            
-            return {
-                'msa': msa,
-                'start': chunk_start,
-                'end': chunk_end,
-                'success': True
-            }
-        except Exception as e:
-            return {
-                'msa': None,
-                'start': chunk_start,
-                'end': chunk_end,
-                'success': False,
-                'error': str(e)
-            }
-    
     def _try_single_fetch(self, max_len, species_preference):
         """
-        Try to fetch one ortholog pair (to be parallelized).
-        This is a single attempt that can run in parallel with other attempts.
+        Try to fetch one ortholog pair with a single MSA query.
         """
         # Pick random region
         coord = random.choice(self.coordinates)
@@ -339,92 +308,64 @@ class ParallelOrthologHelper:
             query_end = coord['end']
         
         try:
-            # Create window queries
-            window_ranges = []
-            for chunk_start in range(query_start, query_end, self.window_size):
-                chunk_end = min(chunk_start + self.window_size, query_end)
-                window_ranges.append((chunk_start, chunk_end))
+            with self.stats_lock:
+                self.stats['total_msa_queries'] += 1
             
-            # PARALLEL MSA QUERIES FOR ALL WINDOWS
-            futures = []
-            for chunk_start, chunk_end in window_ranges:
-                future = self.executor.submit(
-                    self._fetch_msa_window,
-                    coord,
-                    chunk_start,
-                    chunk_end
-                )
-                futures.append(future)
+            # SINGLE MSA QUERY - no windowing!
+            msa = self.genome_msa.get_msa(
+                chrom=coord['chrom'],
+                start=query_start,
+                end=query_end,
+                strand=coord['strand'],
+                tokenize=False
+            )
             
-            # Collect results as they complete
-            window_results = []
-            for future in as_completed(futures):
-                result = future.result()
-                if result['success']:
-                    window_results.append(result)
-            
-            # Sort by start position to maintain order
-            window_results.sort(key=lambda x: x['start'])
-            
-            if not window_results:
+            # msa.shape = (sequence_length, 90_species)
+            if msa.shape[0] == 0 or msa.shape[1] == 0:
                 return None
             
-            # Process windows to extract sequences
-            all_human_seqs = []
-            all_ortho_seqs = []
-            selected_species = None
+            # Extract human sequence (species index 0)
+            # FIX: Use msa[:, 0] not msa[0]
+            human_seq_str = self._array_to_seq(msa[:, 0]).replace('-', '')
             
-            for result in window_results:
-                msa = result['msa']
-                
-                if len(msa) == 0:
-                    continue
-                
-                # Get human sequence
-                human_seq_str = self._array_to_seq(msa[0]).replace('-', '')
-                all_human_seqs.append(human_seq_str)
-                
-                # Select species on first chunk
-                if selected_species is None:
-                    if species_preference == 'close':
-                        species_pool = self.close_species
-                    elif species_preference == 'distant':
-                        species_pool = self.distant_species
-                    else:
-                        species_pool = self.all_species
-                    
-                    valid_species = []
-                    for sp_idx in species_pool:
-                        if sp_idx < len(msa):
-                            sp_seq_str = self._array_to_seq(msa[sp_idx])
-                            alignment_quality = 1.0 - (sp_seq_str.count('-') / len(sp_seq_str))
-                            if alignment_quality >= self.min_alignment_quality:
-                                valid_species.append((sp_idx, alignment_quality))
-                    
-                    if not valid_species:
-                        return None
-                    
-                    valid_species.sort(key=lambda x: x[1], reverse=True)
-                    selected_species = random.choice([s[0] for s in valid_species[:min(5, len(valid_species))]])
-                
-                # Get ortholog sequence
-                if selected_species < len(msa):
-                    ortho_seq_str = self._array_to_seq(msa[selected_species]).replace('-', '')
-                    all_ortho_seqs.append(ortho_seq_str)
+            # Select species based on preference
+            if species_preference == 'close':
+                species_pool = self.close_species
+            elif species_preference == 'distant':
+                species_pool = self.distant_species
+            else:
+                species_pool = self.all_species
             
-            # Concatenate chunks
-            full_human = ''.join(all_human_seqs)
-            full_ortho = ''.join(all_ortho_seqs)
+            # Check alignment quality for candidate species
+            valid_species = []
+            for sp_idx in species_pool:
+                if sp_idx < msa.shape[1]:  # Check against num_species dimension
+                    sp_seq_str = self._array_to_seq(msa[:, sp_idx])  # FIX: Use msa[:, sp_idx]
+                    alignment_quality = 1.0 - (sp_seq_str.count('-') / len(sp_seq_str))
+                    if alignment_quality >= self.min_alignment_quality:
+                        valid_species.append((sp_idx, alignment_quality))
             
-            # Check if we got good sequences
-            if len(full_human) >= 50 and len(full_ortho) >= 50:
+            if not valid_species:
+                return None
+            
+            # Select from top 5 quality species
+            valid_species.sort(key=lambda x: x[1], reverse=True)
+            selected_species = random.choice([s[0] for s in valid_species[:min(5, len(valid_species))]])
+            
+            # Extract ortholog sequence
+            ortho_seq_str = self._array_to_seq(msa[:, selected_species]).replace('-', '')  # FIX
+            
+            # Validate minimum lengths
+            if len(human_seq_str) >= 50 and len(ortho_seq_str) >= 50:
                 metadata = {
                     'coord': coord,
                     'species_idx': selected_species,
-                    'human_len': len(full_human),
-                    'ortho_len': len(full_ortho),
+                    'human_len': len(human_seq_str),
+                    'ortho_len': len(ortho_seq_str),
+                    'requested_len': query_end - query_start,
                 }
-                return (full_human, full_ortho, metadata)
+
+                return (human_seq_str, ortho_seq_str, metadata)
             
             return None
             
@@ -538,6 +479,7 @@ class AsyncOrthologCollator:
         use_rc=True,
         cache_size=100,
         ortholog_frequency=10,
+        num_cache_workers=4
     ):
         self.tokenizer = tokenizer
         self.ortholog_helper = ortholog_helper
@@ -547,6 +489,7 @@ class AsyncOrthologCollator:
         self.use_rc = use_rc
         self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         self.ortholog_frequency = ortholog_frequency
+        self.num_cache_workers = num_cache_workers
         
         self.batch_counter = 0
         
@@ -569,8 +512,11 @@ class AsyncOrthologCollator:
         self.stats_lock = threading.Lock()
         
         if self.cache_enabled:
-            self.cache_thread = threading.Thread(target=self._cache_worker, daemon=True)
-            self.cache_thread.start()
+            self.cache_threads = []
+            for _ in range(self.num_cache_workers):
+                t = threading.Thread(target=self._cache_worker, daemon=True)
+                t.start()
+                self.cache_threads.append(t)
             print(f"✓ Async ortholog caching started (cache_size={cache_size}, frequency=1/{ortholog_frequency})")
             
             print(f"  Warming up cache...", end='', flush=True)
@@ -580,20 +526,25 @@ class AsyncOrthologCollator:
     
     def _cache_worker(self):
         """Background thread that continuously generates ortholog samples."""
+        worker_id = threading.current_thread().name
         while not self.stop_caching.is_set():
             try:
+                start = time.time()
                 views = self._make_views_ortholog()
+                elapsed = time.time() - start
                 
                 if views is not None:
+                    # print(f"[{worker_id}] Generated sample in {elapsed:.2f}s")  # ← ADD THIS
                     try:
                         self.cache_queue.put(views, timeout=0.1)
                     except queue.Full:
                         time.sleep(0.5)
                 else:
+                    # print(f"[{worker_id}] Failed after {elapsed:.2f}s")  # ← ADD THIS
                     time.sleep(0.1)
                     
             except Exception as e:
-                print(f"  ⚠ Cache worker error: {e}")
+                print(f"  ⚠ [{worker_id}] Cache worker error: {e}")
                 time.sleep(1.0)
     
     def _reverse_complement(self, text):
@@ -706,27 +657,22 @@ class AsyncOrthologCollator:
         batch_views = []
         
         if use_ortholog:
-            for _ in batch_texts:
-                try:
-                    views = self.cache_queue.get(timeout=0.1)
-                    batch_views.append(views)
-                    
-                    with self.stats_lock:
-                        self.cache_stats['cache_hits'] += 1
-                        
-                except queue.Empty:
-                    views = self._make_views_normal(batch_texts[0])
-                    batch_views.append(views)
-                    
-                    with self.stats_lock:
-                        self.cache_stats['cache_misses'] += 1
-                        self.cache_stats['fallbacks'] += 1
+            # CHANGED: Wait for cached ortholog samples (no fallback)
+            for idx, text in enumerate(batch_texts):
+                # BLOCKING WAIT - will wait indefinitely until cache has samples
+                views = self.cache_queue.get(block=True, timeout=None)  # ← CHANGE THIS LINE
+                batch_views.append(views)
+                
+                with self.stats_lock:
+                    self.cache_stats['cache_hits'] += 1
         else:
+            # Normal batches
             for text in batch_texts:
                 views = self._make_views_normal(text)
                 batch_views.append(views)
         
         return torch.stack(batch_views)
+
     
     def get_stats(self):
         """Get cache statistics."""
@@ -904,13 +850,14 @@ def main(cfg: DictConfig):
             "steps_per_epoch": 2000,
             "eval_every": 10000,
             "use_ortholog": True,
-            "min_alignment_quality": 0.25,
-            "ortholog_cache_size": 5121,
-            "ortholog_frequency": 10,
-            "parallel_workers": 10,  # Number of parallel threads for MSA
+            "min_alignment_quality": 0.5,
+            "ortholog_cache_size": 1024,
+            "ortholog_frequency": 5,
+            "parallel_workers": 32,  # Number of parallel threads for MSA
+            "num_cache_workers": 4,  # Number of threads for cache population
         })
 
-    wandb.init(project="dna-jepa-ortholog", config=dict(cfg))
+    wandb.init(project="dna-jepa", config=dict(cfg))
     os.makedirs("checkpoints", exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained("zhihan1996/DNABERT-2-117M", trust_remote_code=True, cache_dir="./")
@@ -965,6 +912,7 @@ def main(cfg: DictConfig):
         use_rc=True,
         cache_size=cfg.ortholog_cache_size,
         ortholog_frequency=cfg.ortholog_frequency,
+        num_cache_workers=cfg.num_cache_workers,
     )
 
     train_loader = DataLoader(
